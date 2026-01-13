@@ -8,29 +8,31 @@ TARGET_URL = "https://epg.51zmt.top:8001/multicast/"
 M3U8_OUTPUT_PATH = "tv_channels.m3u8"
 
 def fetch_page_content_with_playwright(url):
-    """用Playwright爬取动态渲染的页面（支持JS加载）"""
+    """用Playwright爬取动态渲染的页面（修复参数错误）"""
     html_content = None
     try:
         with sync_playwright() as p:
-            # 启动无头浏览器（无界面模式，适合CI/CD）
-            browser = p.chromium.launch(headless=True, ignore_https_errors=True)
+            # 启动无头浏览器（launch() 仅接受headless等少数参数）
+            browser = p.chromium.launch(
+                headless=True,  # 仅保留launch()支持的参数
+                args=["--ignore-certificate-errors"]  # 兼容HTTPS证书问题的替代方案
+            )
+            # ignore_https_errors 移到 new_context() 中（正确位置）
             context = browser.new_context(
-                ignore_https_errors=True,
+                ignore_https_errors=True,  # 正确的参数位置
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
             page = context.new_page()
             
-            # 访问页面，等待JS加载完成（关键）
+            # 访问页面，等待JS加载完成
             page.goto(url, timeout=60000)
-            time.sleep(3)  # 等待3秒，确保动态内容加载完毕
-            # 可选：等待特定元素加载（更精准）
-            # page.wait_for_selector("a[href*='rtsp://']", timeout=30000)
+            time.sleep(3)  # 等待动态内容加载
             
             # 获取加载后的完整HTML
             html_content = page.content()
             browser.close()
             
-            # 保存动态加载后的页面到本地
+            # 保存动态页面到本地
             with open("debug_dynamic_page.html", "w", encoding="utf-8") as f:
                 f.write(html_content)
             print("✅ 动态页面爬取成功，已保存 debug_dynamic_page.html 供调试")
