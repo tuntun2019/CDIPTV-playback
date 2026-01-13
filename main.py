@@ -1,106 +1,102 @@
-import requests
+from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 import os
-
-# 禁用 SSL 警告
-requests.packages.urllib3.disable_warnings()
+import time
 
 # 配置项
 TARGET_URL = "https://epg.51zmt.top:8001/multicast/"
 M3U8_OUTPUT_PATH = "tv_channels.m3u8"
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-def fetch_page_content(url):
-    """爬取目标页面内容（保存调试文件）"""
+def fetch_page_content_with_playwright(url):
+    """用Playwright爬取动态渲染的页面（支持JS加载）"""
+    html_content = None
     try:
-        headers = {"User-Agent": USER_AGENT}
-        response = requests.get(url, headers=headers, verify=False, timeout=30)
-        response.raise_for_status()
-        response.encoding = response.apparent_encoding
-        
-        # 保存页面到本地，方便调试
-        with open("debug_page.html", "w", encoding="utf-8") as f:
-            f.write(response.text)
-        print("✅ 页面爬取成功，已保存 debug_page.html 供调试")
-        return response.text
+        with sync_playwright() as p:
+            # 启动无头浏览器（无界面模式，适合CI/CD）
+            browser = p.chromium.launch(headless=True, ignore_https_errors=True)
+            context = browser.new_context(
+                ignore_https_errors=True,
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            page = context.new_page()
+            
+            # 访问页面，等待JS加载完成（关键）
+            page.goto(url, timeout=60000)
+            time.sleep(3)  # 等待3秒，确保动态内容加载完毕
+            # 可选：等待特定元素加载（更精准）
+            # page.wait_for_selector("a[href*='rtsp://']", timeout=30000)
+            
+            # 获取加载后的完整HTML
+            html_content = page.content()
+            browser.close()
+            
+            # 保存动态加载后的页面到本地
+            with open("debug_dynamic_page.html", "w", encoding="utf-8") as f:
+                f.write(html_content)
+            print("✅ 动态页面爬取成功，已保存 debug_dynamic_page.html 供调试")
     except Exception as e:
-        print(f"❌ 爬取页面失败：{e}")
-        return None
+        print(f"❌ 动态爬取页面失败：{e}")
+        import traceback
+        traceback.print_exc()
+    return html_content
 
 def parse_channel_info(html_content):
-    """核心：先找RTSP链接，再反向提取频道信息"""
+    """解析动态页面中的RTSP频道信息"""
     channels = []
     if not html_content:
         return channels
     
     soup = BeautifulSoup(html_content, "lxml")
     try:
-        # 第一步：找到所有包含RTSP链接的a标签（精准筛选目标地址）
+        # 找到所有包含RTSP链接的a标签
         all_a_tags = soup.find_all("a", href=True)
         rtsp_a_tags = [a for a in all_a_tags if a["href"].strip().startswith("rtsp://")]
         print(f"🔍 找到 {len(rtsp_a_tags)} 个包含RTSP链接的a标签")
         
         if len(rtsp_a_tags) == 0:
-            # 兜底：打印所有a标签的href，确认是否有RTSP链接
-            all_hrefs = [a["href"].strip() for a in all_a_tags if a["href"].strip()]
-            print(f"⚠️ 未找到RTSP链接，页面中所有a标签href：{all_hrefs[:10]}")  # 只打印前10个避免刷屏
+            # 打印所有href，确认动态页面是否有RTSP链接
+            all_hrefs = [a["href"].strip() for a in all_a_tags if a["href"].strip()][:20]
+            print(f"⚠️ 动态页面仍未找到RTSP链接，所有a标签href：{all_hrefs}")
             return channels
         
-        # 第二步：遍历每个RTSP链接，提取对应频道信息
+        # 提取频道信息
         for a_tag in rtsp_a_tags:
-            play_url = a_tag["href"].strip()  # RTSP播放地址
-            channel_name = ""
+            play_url = a_tag["href"].strip()
+            channel_name = a_tag.get_text(strip=True) or f"未知频道_{play_url[-6:]}"
             group = "默认分组"
-            logo = ""
             
-            # 提取频道名称：优先找a标签的文本，若无则找父元素的文本
-            if a_tag.get_text(strip=True):
-                channel_name = a_tag.get_text(strip=True)
-            else:
-                # 向上找父元素（p/div/h4等）提取名称
-                parent_elem = a_tag.find_parent(["div", "p", "h4", "li"])
-                if parent_elem:
-                    channel_name = parent_elem.get_text(strip=True).replace("\n", "").replace(" ", "")
-            
-            # 提取分组：找相邻的标签（如span/label），包含「央视」「卫视」「地方」等关键词
-            # 向上找2层父元素，查找分组标签
-            parent_div = a_tag.find_parent("div")
-            if parent_div:
-                group_tags = parent_div.find_all(["span", "label", "b"])
-                for tag in group_tags:
-                    tag_text = tag.get_text(strip=True)
-                    if any(keyword in tag_text for keyword in ["央视", "卫视", "地方", "体育", "电影", "新闻"]):
-                        group = tag_text
+            # 尝试提取分组（从父元素找关键词）
+            parent_elem = a_tag.find_parent(["div", "li", "span"])
+            if parent_elem:
+                parent_text = parent_elem.get_text(strip=True)
+                for keyword in ["央视", "卫视", "地方", "体育", "电影", "新闻"]:
+                    if keyword in parent_text:
+                        group = keyword
                         break
             
-            # 提取台标：找相邻的img标签（优先找class含logo/img的）
-            img_tag = a_tag.find_next_sibling("img") or parent_div.find("img") if parent_div else None
+            # 提取台标（动态页面中的img标签）
+            logo = ""
+            img_tag = a_tag.find_previous_sibling("img") or parent_elem.find("img") if parent_elem else None
             if img_tag and "src" in img_tag.attrs:
                 logo = img_tag["src"].strip()
-                # 补全台标路径
                 if logo and not logo.startswith(("http://", "https://")):
                     logo = f"https://epg.51zmt.top:8001{logo}"
             
-            # 过滤无效频道（名称为空的跳过）
-            if channel_name and play_url:
-                # 清理频道名称中的特殊字符
-                channel_name = channel_name.replace("【", "").replace("】", "").replace("|", "").strip()
-                channels.append({
-                    "name": channel_name,
-                    "url": play_url,
-                    "group": group,
-                    "logo": logo
-                })
+            channels.append({
+                "name": channel_name,
+                "url": play_url,
+                "group": group,
+                "logo": logo
+            })
         
         print(f"✅ 成功解析 {len(channels)} 个有效RTSP频道")
     except Exception as e:
         print(f"❌ 解析频道信息失败：{e}")
-        import traceback
         traceback.print_exc()
     return channels
 
 def generate_m3u8(channels, output_path):
-    """生成带分组、台标的标准 m3u8 文件"""
+    """生成标准m3u8文件"""
     if not channels:
         print("⚠️ 无有效频道，跳过生成m3u8")
         return
@@ -110,7 +106,6 @@ def generate_m3u8(channels, output_path):
         f.write(m3u8_header)
         for idx, channel in enumerate(channels):
             logo = channel["logo"] if channel["logo"] else ""
-            # 构建标准EXTINF行（兼容IPTV播放器）
             extinf_line = f"#EXTINF:-1 tvg-id=\"{idx+1}\" tvg-name=\"{channel['name']}\" tvg-logo=\"{logo}\" group-title=\"{channel['group']}\",{channel['name']}\n"
             f.write(extinf_line)
             f.write(f"{channel['url']}\n\n")
@@ -118,12 +113,12 @@ def generate_m3u8(channels, output_path):
     print(f"📁 m3u8文件生成完成：{output_path}（共{len(channels)}个频道）")
 
 if __name__ == "__main__":
-    # 1. 爬取页面
-    html = fetch_page_content(TARGET_URL)
+    # 1. 爬取动态页面
+    html = fetch_page_content_with_playwright(TARGET_URL)
     if not html:
         exit(1)
     
-    # 2. 解析RTSP频道信息
+    # 2. 解析频道信息
     channels = parse_channel_info(html)
     if not channels:
         print("❌ 未解析到任何有效RTSP频道信息")
